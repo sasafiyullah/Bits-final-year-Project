@@ -115,7 +115,7 @@ When the script runs and export all the SPN a credential nearing expiry, it stor
 
 **Here is an example of the container:**
 
-![SPN Expiry Alert Email](assets/container.png)
+![Container Image](assets/container.png)
 
 ## Customization
 
