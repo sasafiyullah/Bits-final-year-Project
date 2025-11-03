@@ -4,120 +4,73 @@
 
 # --- Login and Graph Connect ---
 Connect-AzAccount -Identity
-Connect-MgGraph -Identity
+Connect-MgGraph -Identity -NoWelcome
 
 # --- Configuration ---
 $storageAccountName = "spnreporting"
-$resourceGroupName = "Automated-Expiry-Notification"
-$containerName = "spnreports"
-$blobName = "spn-data.csv"
-$tempCsvPath = "$env:TEMP\$blobName"
-$date = Get-Date
-$alertDays = @(1,2,3,4,5,6,7,15,30,89)
+$resourceGroupName  = "Automated-Expiry-Notification"
+$containerName      = "spnreports"
+$date               = Get-Date
 
-# Retrieve SendGrid API Key securely from Azure Automation Variable
+# === Date-stamped filenames ===
+$todayString  = $date.ToString("yyyy-MM-dd")
+$blobName     = "$todayString-spn-data.csv"
+$tempCsvPath  = Join-Path $env:TEMP $blobName
+$retentionDays = 10
+$alertDays     = @(1,2,3,4,5,6,7,15,30,89,90)
+
+# --- Retrieve SendGrid API Key securely from Azure Automation Variable ---
 Write-Host "Retrieving SendGrid API Key from Automation Variables..."
 $SendGridApiKey = Get-AutomationVariable -Name "SendGridApiKey"
 if (-not $SendGridApiKey) {
-    Write-Error "Fatal Error: Could not retrieve the 'SendGridApiKey' Automation Variable. Check variable existence and permissions. Exiting script."
-    # Disconnect before exiting for cleanup
+    Write-Error "Fatal Error: Could not retrieve the 'SendGridApiKey' Automation Variable."
     Disconnect-AzAccount -Confirm:$false
     Disconnect-MgGraph
     Exit 1
 }
 
 $FromEmail = "sasafiyullah@outlook.com"
-$FromName = "SPN-Notification"
+$FromName  = "SPN-Notification"
 
-# --- Storage Context using Storage Key ---
+# --- Storage Context ---
 try {
     $storageKey = (Get-AzStorageAccountKey -ResourceGroupName $resourceGroupName -Name $storageAccountName)[0].Value
-    $ctx = New-AzStorageContext -StorageAccountName $storageAccountName -StorageAccountKey $storageKey
+    $ctx        = New-AzStorageContext -StorageAccountName $storageAccountName -StorageAccountKey $storageKey
 } catch {
-    Write-Error "Failed to create Azure Storage context. Check resource group/storage account name or permissions."
+    Write-Error "Failed to create Azure Storage context. Error: $($_.Exception.Message)"
+    Disconnect-AzAccount -Confirm:$false
+    Disconnect-MgGraph
     Exit 1
 }
 
-# --- Cleanup Old Reports ---
-write-host "--- Cleaning up old local and blob reports... ---"
-# Clean Old CSVs in TEMP
-Get-ChildItem -Path $env:TEMP | Where-Object { $_.Name -like "spn-data*" } | Remove-Item -Force -ErrorAction SilentlyContinue
-# Clean Old Blobs
-Get-AzStorageBlob -Container $containerName -Context $ctx | Where-Object { $_.Name -like "spn-data*" } | ForEach-Object {
-    Remove-AzStorageBlob -Container $containerName -Blob $_.Name -Context $ctx
+# === Cleanup: 30-day retention policy ===
+Write-Host "--- Cleaning up old local and blob reports... ---"
+Get-ChildItem -Path $env:TEMP -Filter "*-spn-data.csv" -ErrorAction SilentlyContinue |
+    Remove-Item -Force -ErrorAction SilentlyContinue
+
+$retentionThreshold = (Get-Date).AddDays(-$retentionDays)
+$deletedCount = 0
+Get-AzStorageBlob -Container $containerName -Context $ctx -ErrorAction SilentlyContinue | Where-Object {
+    $_.Name -like "*-spn-data.csv" -and $_.LastModified.UtcDateTime -lt $retentionThreshold
+} | ForEach-Object {
+    Remove-AzStorageBlob -Container $containerName -Blob $_.Name -Context $ctx -ErrorAction SilentlyContinue
+    $deletedCount++
 }
-write-host "Successfully deleted the old reports."
-
-# --- Fetch SPNs and Owners ---
-write-host "--- Fetching all applications and credentials from Microsoft Graph... ---"
-$spns = Get-MgApplication -All
-$results = @()
-
-foreach ($spn in $spns) {
-    try {
-        # FIX: Get full application details (including credentials) in one efficient call
-        $fullApplication = Get-MgApplication -ApplicationId $spn.Id -Property "DisplayName,KeyCredentials,PasswordCredentials"
-        $owners = Get-MgApplicationOwner -ApplicationId $spn.Id
-        
-        $ownerNames = $owners.AdditionalProperties.displayName -join ";"
-
-        $emailList = @()
-        foreach ($owner in $owners) {
-            $email = $owner.AdditionalProperties.mail
-            if (-not [string]::IsNullOrEmpty($email)) {
-                if ($email -match "_") {
-                    $emailList += $email.Split("_")[1]
-                } else {
-                    $emailList += $email
-                }
-            }
-        }
-        $ownerEmails = $emailList -join ","
-
-        $creds = $fullApplication.KeyCredentials
-        $secrets = $fullApplication.PasswordCredentials
-        $allCreds = $creds + $secrets
-
-        foreach ($cred in $allCreds) {
-            if ($cred -is [Microsoft.Graph.PowerShell.Models.MicrosoftGraphKeyCredential]) {
-                $type = "Certificate"
-            } else {
-                $type = "Secret"
-            }
-
-            $results += [PSCustomObject]@{
-                Name        = $spn.DisplayName
-                ExpiryDate  = $cred.EndDateTime.ToString("yyyy-MM-dd")
-                Type        = $type
-                OwnerName   = $ownerNames
-                OwnerEmail  = $ownerEmails
-            }
-        }
-    } catch {
-        Write-Warning "Could not process application $($spn.DisplayName) ($($spn.Id)). Error: $($_.Exception.Message)"
-    }
-}
-
-# --- Save to CSV and Upload to Blob ---
-write-host "--- Saving data to CSV and uploading to blob storage... ---"
-$results | Export-Csv -Path $tempCsvPath -NoTypeInformation
-Set-AzStorageBlobContent -File $tempCsvPath -Container $containerName -Blob $blobName -Context $ctx -Force
-write-host "Report saved to $containerName/$blobName."
-
+Write-Host "Deleted $deletedCount old report(s)."
 
 # =================================================================
-# Email Functions and Styling
+# HTML Styling & Email
 # =================================================================
 
-# --- HTML Styling ---
 $HtmlHead = @'
 <style>
     body { font-family: Calibri, sans-serif; background-color: #f4f4f4; padding: 20px; }
-    .container { background-color: white; padding: 20px; border-radius: 8px; box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1); }
+    .container { background-color: white; padding: 20px; border-radius: 8px; }
     table { border-collapse: collapse; width: 100%; margin-top: 15px; }
     th, td { border: 1px solid #ddd; padding: 10px; text-align: left; }
     th { background-color: #facb48; font-weight: bold; }
     .alert-header { color: #cc0000; font-size: 1.2em; margin-bottom: 10px; }
+    .footer { color: #666; font-size: 0.85em; margin-top: 15px; }
 </style>
 '@
 
@@ -126,12 +79,13 @@ function Get-HtmlTable {
     $rowsHtml = $Rows | ForEach-Object {
         "<tr><td>$($_.SPN)</td><td>$($_.Expiry)</td><td>$($_.Type)</td><td>$($_.Owner)</td><td>$($_.Email)</td></tr>"
     }
-    return @"
+    $table = @"
 <table>
 <tr><th>SPN</th><th>Expiry</th><th>Type</th><th>Owner</th><th>Email</th></tr>
 $rowsHtml
 </table>
 "@
+    return $table
 }
 
 function Send-EmailViaSendGrid {
@@ -143,12 +97,11 @@ function Send-EmailViaSendGrid {
         [string]$Body,
         [string]$SendGridApiKey
     )
-    
-    $validToEmails = $ToEmails | Where-Object { -not [string]::IsNullOrEmpty($_) }
 
+    $validToEmails = $ToEmails | Where-Object { -not [string]::IsNullOrEmpty($_) }
     if (-not $validToEmails) {
         Write-Warning "No valid recipients found for email: $Subject. Skipping."
-        return 
+        return
     }
 
     $toRecipients = @()
@@ -158,47 +111,118 @@ function Send-EmailViaSendGrid {
 
     $payload = @{
         personalizations = @(@{ to = $toRecipients; subject = $Subject })
-        from = @{ email = $FromEmail; name = $FromName }
-        content = @(@{ type = "text/html"; value = $Body })
+        from             = @{ email = $FromEmail; name = $FromName }
+        content          = @(@{ type = "text/html"; value = $Body })
     }
 
     try {
         $jsonBody = $payload | ConvertTo-Json -Depth 10
         Invoke-RestMethod -Uri "https://api.sendgrid.com/v3/mail/send" -Method POST `
-            -Headers @{ Authorization = "Bearer $SendGridApiKey" } -ContentType "application/json" `
-            -Body $jsonBody -MaximumRedirection 0 # Added to prevent unnecessary redirects
-        
-        # --- ENHANCEMENT: SUCCESS LOG MESSAGE ---
+            -Headers @{
+                Authorization = "Bearer $SendGridApiKey"
+                "Content-Type" = "application/json"
+            } `
+            -Body $jsonBody -MaximumRedirection 0
         Write-Host "Successfully sent email: '$Subject' to $($validToEmails -join ', ')"
-        
     } catch {
-        # --- ERROR LOG MESSAGE ---
         Write-Error "Failed to send email via SendGrid: $($_.Exception.Message)"
     }
 }
 
+# =================================================================
+# Fetch SPNs and Owners
+# =================================================================
+
+Write-Host "--- Fetching all applications and credentials from Microsoft Graph... ---"
+
+$spns     = Get-MgApplication -All -Property "Id,DisplayName,KeyCredentials,PasswordCredentials"
+$results  = @()
+
+foreach ($spn in $spns) {
+    try {
+        $fullApplication = Get-MgApplication -ApplicationId $spn.Id -Property "DisplayName,KeyCredentials,PasswordCredentials"
+        $owners = Get-MgApplicationOwner -ApplicationId $spn.Id -ErrorAction SilentlyContinue
+
+        $ownerNames  = $null
+        $ownerEmails = $null
+
+        if ($owners) {
+            $ownerNames = ($owners | ForEach-Object { $_.AdditionalProperties.displayName }) -join ";"
+
+            $emailList = @()
+            foreach ($owner in $owners) {
+                $ap = $owner.AdditionalProperties
+                # Prefer user.mail (guests and members), include group mail if present; skip SPNs
+                if ($ap.'@odata.type' -eq "#microsoft.graph.user") {
+                    if ($ap.mail) { $emailList += $ap.mail }
+                } elseif ($ap.'@odata.type' -eq "#microsoft.graph.group") {
+                    if ($ap.mail) { $emailList += $ap.mail }
+                }
+            }
+            $ownerEmails = ($emailList | Where-Object { $_ }) -join ","
+        }
+
+        $creds    = $fullApplication.KeyCredentials
+        $secrets  = $fullApplication.PasswordCredentials
+        $allCreds = @()
+        if ($creds)   { $allCreds += $creds }
+        if ($secrets) { $allCreds += $secrets }
+
+        foreach ($cred in $allCreds) {
+            if (-not $cred.EndDateTime) { continue }
+            $type = if ($cred -is [Microsoft.Graph.PowerShell.Models.MicrosoftGraphKeyCredential]) { "Certificate" } else { "Secret" }
+
+            $results += [PSCustomObject]@{
+                Name       = $fullApplication.DisplayName
+                ExpiryDate = $cred.EndDateTime.ToString("yyyy-MM-dd")
+                Type       = $type
+                OwnerName  = $ownerNames
+                OwnerEmail = $ownerEmails
+            }
+        }
+    } catch {
+        Write-Warning "Could not process application $($spn.DisplayName) ($($spn.Id)). Error: $($_.Exception.Message)"
+    }
+}
+
+# =================================================================
+# Save to CSV and Upload
+# =================================================================
+
+Write-Host "--- Saving data to CSV and uploading to blob storage... ---"
+if ($results -and $results.Count -gt 0) {
+    $results | Export-Csv -Path $tempCsvPath -NoTypeInformation -Encoding UTF8
+    Set-AzStorageBlobContent -File $tempCsvPath -Container $containerName -Blob $blobName -Context $ctx -Force | Out-Null
+    Write-Host "Report saved to $containerName/$blobName."
+} else {
+    Write-Host "No results found. Skipping CSV export and upload."
+}
 
 # =================================================================
 # Alerting Logic
 # =================================================================
 
-write-host "--- Checking for expiring SPNs and sending alerts... ---"
+Write-Host "--- Checking for expiring SPNs and sending alerts... ---"
 
-# Retrieve the latest CSV from the blob
-Get-AzStorageBlobContent -Container $containerName -Blob $blobName -Destination $tempCsvPath -Context $ctx -Force
-$spnData = Import-Csv $tempCsvPath
+if (-not $results -or $results.Count -eq 0) {
+    Write-Host "No SPN data found or processed. Skipping alerting."
+    Disconnect-AzAccount -Confirm:$false
+    Disconnect-MgGraph
+    Write-Host "Script execution complete."
+    Exit 0
+}
 
-foreach ($spn in $spnData) {
+foreach ($spn in $results) {
     $expiryDate = [datetime]$spn.ExpiryDate
-    $daysLeft = ($expiryDate - $date).Days
+    $daysLeft   = ($expiryDate.Date - $date.Date).Days
 
     if ($daysLeft -in $alertDays) {
         $row = [PSCustomObject]@{
-            SPN     = $spn.Name
-            Expiry  = $expiryDate.ToString("dd-MMM-yyyy")
-            Type    = $spn.Type
-            Owner   = $spn.OwnerName
-            Email   = $spn.OwnerEmail
+            SPN    = $spn.Name
+            Expiry = $expiryDate.ToString("dd-MMM-yyyy")
+            Type   = $spn.Type
+            Owner  = $spn.OwnerName
+            Email  = $spn.OwnerEmail
         }
 
         $tableHtml = Get-HtmlTable @($row)
@@ -212,27 +236,35 @@ foreach ($spn in $spnData) {
 <p class="alert-header">Your $($row.Type) for SPN <b>$($row.SPN)</b> is expiring in <b>$daysLeft</b> days on $($row.Expiry).</p>
 $tableHtml
 <p>Please renew this credential immediately to avoid service disruption.</p>
-<p>Regard</p>
+<p>Regards,</p>
 <p>Cloud-Admin</p>
+<p class="footer">This is an automated message from SPN-Expiry-Automation. Do not reply to this email.</p>
 </div>
 </body>
 </html>
 "@
-        # Split and clean recipient emails
-        $recipients = $row.Email.Split(",", [System.StringSplitOptions]::RemoveEmptyEntries) | ForEach-Object { $_.Trim() }
+
+        $recipients = @()
+        if ($row.Email) {
+            $recipients = $row.Email.Split(",", [System.StringSplitOptions]::RemoveEmptyEntries) | ForEach-Object { $_.Trim() }
+        }
+        if (-not $recipients -or $recipients.Count -eq 0) {
+            Write-Warning "No owner emails found for '$($row.SPN)'. Skipping alert email."
+            continue
+        }
 
         Send-EmailViaSendGrid `
             -FromEmail $FromEmail `
-            -FromName $FromName `
-            -ToEmails $recipients `
-            -Subject "SPN $($row.Type) Expiry Alert: $($row.SPN) - $daysLeft Days Remaining" `
-            -Body $htmlBody `
+            -FromName  $FromName `
+            -ToEmails  $recipients `
+            -Subject   "SPN $($row.Type) Expiry Alert: $($row.SPN) - $daysLeft Days Remaining" `
+            -Body      $htmlBody `
             -SendGridApiKey $SendGridApiKey
     }
 }
 
 # --- Disconnect Sessions (Best Practice) ---
-write-host "--- Disconnecting sessions. ---"
+Write-Host "--- Disconnecting sessions. ---"
 Disconnect-AzAccount -Confirm:$false
 Disconnect-MgGraph
-write-host "Script execution complete."
+Write-Host "Script execution complete."
