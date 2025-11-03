@@ -115,3 +115,11 @@ The script is now fully automated and will run on the schedule you defined.
     `$alertDays = @(1, 7, 30, 90)`
 * **Email HTML:** The HTML and CSS for the email are defined in the `$HtmlHead` variable and the `Get-HtmlTable` function. You can modify these to match your company's branding.
 * **Owner Email Logic:** The script contains custom logic to parse emails (`if ($email -match "_")`). This can be modified or removed if your organization's email formats are different.
+
+## 📧 Output Example
+
+When the script detects a credential nearing expiry, it sends a clear, HTML-formatted email alert to the application owners.
+
+**Here is an example of the notification email:**
+
+![SPN Expiry Alert Email](assets/email-alert-example.png)
