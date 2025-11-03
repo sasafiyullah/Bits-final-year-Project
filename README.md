@@ -111,7 +111,7 @@ The script is now fully automated and will run on the schedule you defined.
 
 ## Container where CSV save Example
 
-When the script runs and export all the SPN a credential nearing expiry, it store the CSV in a specific container.
+When the script runs and export all the SPN credential nearing expiry, it store the CSV in a specific container.
 
 **Here is an example of the container:**
 
