@@ -147,6 +147,10 @@ When the script detects a credential nearing expiry, it sends a clear, HTML-form
 ![LabTest](assets/output.png)
 
 
+## JOB RUNTIME < 15 mins for 100+ SPN's
+
+![Jobruntime](assets/JobRuntime.png)
+
 
 
 
